@@ -1,0 +1,622 @@
+
+--- a/preload.js
++++ b/preload.js
+@@ -16,7 +16,11 @@
+   services: buildApi("services"),
+   inventory: buildApi("inventory"),
+   suppliers: buildApi("suppliers"),
+-  appointments: buildApi("appointments"),
++  appointments: {
++    ...buildApi("appointments"),
++    resolveSmart: (data) => ipcRenderer.invoke("appointments:resolveSmart", data),
++    createSmart: (data) => ipcRenderer.invoke("appointments:createSmart", data)
++  },
+   workOrders: buildApi("workOrders"),
+   invoices: buildApi("invoices"),
+   storage: buildApi("storage"),
+--- a/registers.js
++++ b/registers.js
+@@ -48,6 +48,82 @@
+   try {
+     ipcMain.removeHandler(name);
+   } catch (_) {}
++}
++function normalizeDbText(value) {
++  return String(value ?? "").trim();
++}
++function normalizeDbUpper(value) {
++  return normalizeDbText(value).toUpperCase();
++}
++function normalizeDbSentence(value) {
++  const text = normalizeDbText(value);
++  if (!text) return "";
++  return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
++}
++function normalizeVehicleType(value) {
++  const upper = normalizeDbUpper(value);
++  return upper === "NOLEGGIO" ? "Noleggio" : upper === "PRIVATO" ? "Privato" : normalizeDbSentence(value);
++}
++function normalizeDbField(field, value) {
++  if (value === null || value === undefined) return null;
++  if (["tread_front_mm", "tread_rear_mm"].includes(field)) {
++    if (value === "") return null;
++    const numeric = Number(value);
++    return Number.isNaN(numeric) ? null : numeric;
++  }
++  if (["customer_id", "vehicle_id"].includes(field)) {
++    if (value === "" || value === null || value === undefined) return null;
++    const numeric = Number(value);
++    return Number.isNaN(numeric) ? null : numeric;
++  }
++  if (field === "email") {
++    const text = normalizeDbText(value).toLowerCase();
++    return text || null;
++  }
++  if (["name", "targa", "rental_company", "size", "tire_size", "customer_name"].includes(field)) {
++    const text = normalizeDbUpper(value);
++    return text || null;
++  }
++  if (field === "vehicle_type") {
++    const text = normalizeVehicleType(value);
++    return text || null;
++  }
++  const text = normalizeDbText(value);
++  return text || null;
++}
++async function firstRow(query, params = []) {
++  const rows = await db.all(query, params);
++  return rows[0] || null;
++}
++async function findAppointmentEntities(data = {}) {
++  const plate = normalizeDbUpper(data.targa);
++  const owner = normalizeDbUpper(data.customer_name || data.name || data.owner_name);
++  let vehicle = null;
++  let customer = null;
++
++  if (plate) {
++    vehicle = await firstRow(
++      `SELECT * FROM vehicles WHERE UPPER(TRIM(COALESCE(targa, ''))) = ? ORDER BY id DESC`,
++      [plate]
++    );
++    if (vehicle?.customer_id) {
++      customer = await firstRow(`SELECT * FROM customers WHERE id = ? LIMIT 1`, [vehicle.customer_id]);
++    }
++  }
++
++  if (!customer && owner) {
++    customer = await firstRow(
++      `SELECT * FROM customers WHERE UPPER(TRIM(COALESCE(name, ''))) = ? ORDER BY id DESC`,
++      [owner]
++    );
++  }
++
++  let vehicles = [];
++  if (customer?.id) {
++    vehicles = await db.all(`SELECT * FROM vehicles WHERE customer_id = ? ORDER BY id DESC`, [customer.id]);
++    if (!vehicle && plate) {
++      vehicle = vehicles.find((item) => normalizeDbUpper(item.targa) === plate) || null;
++    }
++    if (!vehicle && vehicles.length === 1) {
++      vehicle = vehicles[0];
++    }
++  }
++
++  return { customer, vehicle, vehicles };
+ }
+ function registerCrud(name, table, fields) {
+   safeRemove(`${name}:getAll`);
+@@ -101,6 +177,78 @@
+ Object.entries(TABLES).forEach(([key, meta]) => {
+   registerCrud(key, meta.table, meta.fields);
+ });
++safeRemove("appointments:resolveSmart");
++safeRemove("appointments:createSmart");
++ipcMain.handle("appointments:resolveSmart", async (_, data) => {
++  const result = await findAppointmentEntities(data || {});
++  return {
++    ok: true,
++    found: !!(result.customer || result.vehicle),
++    customer: result.customer,
++    vehicle: result.vehicle,
++    vehicles: result.vehicles
++  };
++});
++ipcMain.handle("appointments:createSmart", async (_, data) => {
++  const payload = data || {};
++  const resolved = await findAppointmentEntities(payload);
++  let customer = resolved.customer;
++  let vehicle = resolved.vehicle;
++
++  const customerName = normalizeDbField("customer_name", payload.customer_name || payload.name || payload.owner_name);
++  const customerEmail = normalizeDbField("email", payload.customer_email || payload.email);
++  const customerPhone = normalizeDbField("phone", payload.customer_phone || payload.phone);
++  const plate = normalizeDbField("targa", payload.targa);
++
++  if (!customer) {
++    if (!customerName) {
++      throw new Error("CUSTOMER_NAME_REQUIRED");
++    }
++    await db.run(`INSERT INTO customers (name, email, phone) VALUES (?, ?, ?)`, [customerName, customerEmail, customerPhone]);
++    customer = await firstRow(`SELECT * FROM customers WHERE UPPER(TRIM(COALESCE(name, ''))) = ? ORDER BY id DESC`, [customerName]);
++  }
++
++  if (!vehicle && plate) {
++    vehicle = await firstRow(`SELECT * FROM vehicles WHERE UPPER(TRIM(COALESCE(targa, ''))) = ? ORDER BY id DESC`, [plate]);
++  }
++
++  if (!vehicle && plate) {
++    await db.run(
++      `INSERT INTO vehicles (customer_id, targa, marca, modello, vehicle_type, rental_company, tire_size, seasonality, tread_front_mm, tread_rear_mm, vehicle_notes, revision_due, service_due) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++      [
++        customer?.id || null,
++        plate,
++        normalizeDbField("marca", payload.marca),
++        normalizeDbField("modello", payload.modello),
++        normalizeDbField("vehicle_type", payload.vehicle_type) || "Privato",
++        normalizeDbField("rental_company", payload.rental_company),
++        normalizeDbField("tire_size", payload.tire_size),
++        normalizeDbField("seasonality", payload.seasonality),
++        normalizeDbField("tread_front_mm", payload.tread_front_mm),
++        normalizeDbField("tread_rear_mm", payload.tread_rear_mm),
++        normalizeDbField("vehicle_notes", payload.vehicle_notes),
++        normalizeDbField("revision_due", payload.revision_due),
++        normalizeDbField("service_due", payload.service_due)
++      ]
++    );
++    vehicle = await firstRow(`SELECT * FROM vehicles WHERE UPPER(TRIM(COALESCE(targa, ''))) = ? ORDER BY id DESC`, [plate]);
++  }
++
++  const appointmentCustomerId = customer?.id || null;
++  const appointmentVehicleId = payload.vehicle_id ? Number(payload.vehicle_id) || null : vehicle?.id || null;
++  if (!appointmentCustomerId) {
++    throw new Error("APPOINTMENT_CUSTOMER_REQUIRED");
++  }
++
++  await db.run(
++    `INSERT INTO appointments (customer_id, vehicle_id, scheduled_at, note, service_ids) VALUES (?, ?, ?, ?, ?)`,
++    [
++      appointmentCustomerId,
++      appointmentVehicleId,
++      normalizeDbField("scheduled_at", payload.scheduled_at),
++      normalizeDbField("note", payload.note),
++      Array.isArray(payload.service_ids)
++        ? payload.service_ids.map((item) => Number(item)).filter(Boolean).join(",") || null
++        : normalizeDbText(payload.service_ids) || null
++    ]
++  );
++
++  const appointment = await firstRow(`SELECT * FROM appointments ORDER BY id DESC LIMIT 1`);
++  const linkedVehicle = appointmentVehicleId ? await firstRow(`SELECT * FROM vehicles WHERE id = ? LIMIT 1`, [appointmentVehicleId]) : null;
++
++  return {
++    ok: true,
++    appointment,
++    customer,
++    vehicle: linkedVehicle || vehicle || null,
++    createdCustomer: !resolved.customer && !!customer,
++    createdVehicle: !resolved.vehicle && !!(linkedVehicle || vehicle)
++  };
++});
++
+ safeRemove("backup:getAllData");
+ safeRemove("backup:restoreAll");
+ ipcMain.handle("backup:getAllData", async () => {
+--- a/App.jsx
++++ b/App.jsx
+@@ -220,6 +220,22 @@
+     else if (field.type === "service-checklist") form[field.key] = [];
+     else form[field.key] = "";
+   });
++  if (entityKey === "appointments") {
++    return {
++      ...form,
++      customer_name: "",
++      customer_email: "",
++      customer_phone: "",
++      targa: "",
++      marca: "",
++      modello: "",
++      vehicle_type: "Privato",
++      rental_company: "",
++      tire_size: "",
++      seasonality: "",
++      tread_front_mm: "",
++      tread_rear_mm: "",
++      vehicle_notes: "",
++      revision_due: "",
++      service_due: ""
++    };
++  }
+   return form;
+ }
+@@ -531,6 +547,7 @@
+   const [deadlineCustomerFilter, setDeadlineCustomerFilter] = useState("all");
+   const [messageTemplates, setMessageTemplates] = useState(() => readMessageTemplates());
+   const [messageTestType, setMessageTestType] = useState("revision");
++  const [appointmentLookupBusy, setAppointmentLookupBusy] = useState(false);
+   const refs = useMemo(
+     () => ({
+       customersById: Object.fromEntries((db.customers || []).map((x) => [x.id, x])),
+@@ -541,6 +558,11 @@
+     }),
+     [db]
+   );
++  const appointmentLookupKeyRef = useRef("");
++  const appointmentCustomerVehicles = useMemo(() => {
++    const appointmentCustomerId = Number(forms.appointments?.customer_id || 0);
++    if (!appointmentCustomerId) return [];
++    return (db.vehicles || []).filter((vehicle) => Number(vehicle.customer_id || 0) === appointmentCustomerId);
++  }, [forms.appointments?.customer_id, db.vehicles]);
+@@ -636,9 +658,34 @@
+ 
+       if (entityKey === "appointments" && fieldKey === "customer_id") {
+         nextEntity.vehicle_id = "";
+       }
+ 
++      if (entityKey === "appointments") {
++        if (fieldKey === "customer_name") {
++          nextEntity.customer_id = "";
++        }
++        if (fieldKey === "targa") {
++          nextEntity.vehicle_id = "";
++        }
++        if (fieldKey === "vehicle_id") {
++          const selectedVehicle = (db.vehicles || []).find((item) => String(item.id) === String(value));
++          if (selectedVehicle) {
++            const linkedCustomer = (db.customers || []).find((item) => String(item.id) === String(selectedVehicle.customer_id || ""));
++            nextEntity.customer_id = selectedVehicle.customer_id || nextEntity.customer_id || "";
++            nextEntity.customer_name = linkedCustomer?.name || nextEntity.customer_name || "";
++            nextEntity.customer_email = linkedCustomer?.email || nextEntity.customer_email || "";
++            nextEntity.customer_phone = linkedCustomer?.phone || nextEntity.customer_phone || "";
++            nextEntity.targa = selectedVehicle.targa || nextEntity.targa || "";
++            nextEntity.marca = selectedVehicle.marca || nextEntity.marca || "";
++            nextEntity.modello = selectedVehicle.modello || nextEntity.modello || "";
++            nextEntity.vehicle_type = selectedVehicle.vehicle_type || nextEntity.vehicle_type || "Privato";
++            nextEntity.rental_company = selectedVehicle.rental_company || nextEntity.rental_company || "";
++            nextEntity.tire_size = selectedVehicle.tire_size || nextEntity.tire_size || "";
++            nextEntity.seasonality = selectedVehicle.seasonality || nextEntity.seasonality || "";
++            nextEntity.tread_front_mm = selectedVehicle.tread_front_mm ?? nextEntity.tread_front_mm;
++            nextEntity.tread_rear_mm = selectedVehicle.tread_rear_mm ?? nextEntity.tread_rear_mm;
++            nextEntity.vehicle_notes = selectedVehicle.vehicle_notes || nextEntity.vehicle_notes || "";
++            nextEntity.revision_due = selectedVehicle.revision_due || nextEntity.revision_due || "";
++            nextEntity.service_due = selectedVehicle.service_due || nextEntity.service_due || "";
++          }
++        }
++      }
+       return {
+         ...prev,
+         [entityKey]: nextEntity
+       };
+@@ -694,6 +741,193 @@
+       };
+     });
+   }
++  function syncAppointmentFormWithLookup(result) {
++    const customer = result?.customer || null;
++    const vehicle = result?.vehicle || null;
++    setForms((prev) => {
++      const current = prev.appointments || buildEmptyForm("appointments");
++      return {
++        ...prev,
++        appointments: {
++          ...current,
++          customer_id: customer?.id || "",
++          vehicle_id: vehicle?.id || "",
++          customer_name: customer?.name || current.customer_name || "",
++          customer_email: customer?.email || current.customer_email || "",
++          customer_phone: customer?.phone || current.customer_phone || "",
++          targa: vehicle?.targa || current.targa || "",
++          marca: vehicle?.marca || current.marca || "",
++          modello: vehicle?.modello || current.modello || "",
++          vehicle_type: vehicle?.vehicle_type || current.vehicle_type || "Privato",
++          rental_company: vehicle?.rental_company || current.rental_company || "",
++          tire_size: vehicle?.tire_size || current.tire_size || "",
++          seasonality: vehicle?.seasonality || current.seasonality || "",
++          tread_front_mm: vehicle?.tread_front_mm ?? current.tread_front_mm,
++          tread_rear_mm: vehicle?.tread_rear_mm ?? current.tread_rear_mm,
++          vehicle_notes: vehicle?.vehicle_notes || current.vehicle_notes || "",
++          revision_due: vehicle?.revision_due || current.revision_due || "",
++          service_due: vehicle?.service_due || current.service_due || ""
++        }
++      };
++    });
++  }
++  async function resolveAppointmentAutofill(showFoundStatus = false) {
++    const current = forms.appointments || {};
++    const lookupPlate = upperCaseValue(current.targa);
++    const lookupOwner = normalizeTextValue("name", current.customer_name);
++    if (!lookupPlate && !lookupOwner) {
++      appointmentLookupKeyRef.current = "";
++      setForms((prev) => ({
++        ...prev,
++        appointments: {
++          ...prev.appointments,
++          customer_id: "",
++          vehicle_id: ""
++        }
++      }));
++      return;
++    }
++    try {
++      setAppointmentLookupBusy(true);
++      const result = await window.api.appointments.resolveSmart({
++        targa: lookupPlate,
++        customer_name: lookupOwner
++      });
++      if (result?.found) {
++        syncAppointmentFormWithLookup(result);
++        if (showFoundStatus) {
++          setStatus("Appuntamenti: cliente e veicolo compilati automaticamente ✅");
++        }
++      } else {
++        setForms((prev) => ({
++          ...prev,
++          appointments: {
++            ...prev.appointments,
++            customer_id: "",
++            vehicle_id: ""
++          }
++        }));
++      }
++    } catch (err) {
++      console.error("Errore ricerca smart appuntamento:", err);
++      if (showFoundStatus) {
++        setStatus("Errore ricerca cliente o veicolo per l'appuntamento");
++      }
++    } finally {
++      setAppointmentLookupBusy(false);
++    }
++  }
++  async function createAppointmentSmart() {
++    const current = forms.appointments || {};
++    if (!current.scheduled_at) {
++      setStatus('Il campo "Data e ora" è obbligatorio');
++      return;
++    }
++    const lookupPlate = upperCaseValue(current.targa);
++    const ownerName = normalizeTextValue("name", current.customer_name);
++    if (!lookupPlate && !ownerName) {
++      setStatus("Inserisci almeno la targa o il proprietario");
++      return;
++    }
++    if (!current.customer_id && !ownerName) {
++      setStatus("Inserisci il nome del proprietario per creare automaticamente il cliente");
++      return;
++    }
++    if (normalizeTextValue("vehicle_type", current.vehicle_type) === "Noleggio" && !normalizeTextValue("rental_company", current.rental_company)) {
++      setStatus('Il campo "Società di noleggio" è obbligatorio per i veicoli a noleggio');
++      return;
++    }
++    try {
++      await window.api.appointments.createSmart({
++        customer_id: current.customer_id || null,
++        vehicle_id: current.vehicle_id || null,
++        customer_name: ownerName,
++        customer_email: normalizeTextValue("email", current.customer_email),
++        customer_phone: normalizeTextValue("phone", current.customer_phone),
++        targa: lookupPlate,
++        marca: normalizeTextValue("marca", current.marca),
++        modello: normalizeTextValue("modello", current.modello),
++        vehicle_type: normalizeTextValue("vehicle_type", current.vehicle_type) || "Privato",
++        rental_company: normalizeTextValue("rental_company", current.rental_company),
++        tire_size: normalizeTextValue("tire_size", current.tire_size),
++        seasonality: normalizeTextValue("seasonality", current.seasonality),
++        tread_front_mm: current.tread_front_mm,
++        tread_rear_mm: current.tread_rear_mm,
++        vehicle_notes: normalizeTextValue("vehicle_notes", current.vehicle_notes),
++        revision_due: current.revision_due || null,
++        service_due: current.service_due || null,
++        scheduled_at: current.scheduled_at || null,
++        note: normalizeTextValue("note", current.note),
++        service_ids: parseServiceIds(current.service_ids)
++      });
++      setShowForm((prev) => ({
++        ...prev,
++        appointments: false
++      }));
++      setForms((prev) => ({
++        ...prev,
++        appointments: buildEmptyForm("appointments")
++      }));
++      appointmentLookupKeyRef.current = "";
++      setStatus("Appuntamenti: record creato ✅");
++      await loadAll();
++    } catch (err) {
++      console.error("Errore creazione smart appuntamento:", err);
++      if (String(err?.message || "").includes("CUSTOMER_NAME_REQUIRED")) {
++        setStatus("Per creare automaticamente un nuovo cliente devi compilare il proprietario");
++        return;
++      }
++      setStatus("Errore creazione Appuntamenti");
++    }
++  }
++  useEffect(() => {
++    const lookupPlate = upperCaseValue(forms.appointments?.targa);
++    const lookupOwner = normalizeTextValue("name", forms.appointments?.customer_name);
++    const key = `${lookupPlate}|${lookupOwner}`;
++    if (!lookupPlate && !lookupOwner) {
++      appointmentLookupKeyRef.current = "";
++      return;
++    }
++    if (key === appointmentLookupKeyRef.current) return;
++    const timer = setTimeout(async () => {
++      appointmentLookupKeyRef.current = key;
++      await resolveAppointmentAutofill(false);
++    }, 320);
++    return () => clearTimeout(timer);
++  }, [forms.appointments?.targa, forms.appointments?.customer_name]);
++  function renderAppointmentSmartForm() {
++    const form = forms.appointments || buildEmptyForm("appointments");
++    const selectedVehicle = refs.vehiclesById[form.vehicle_id];
++    const matchedCustomer = refs.customersById[form.customer_id];
++    return (
++      <>
++        <div style={fieldMutedStyle}>
++          Inserisci targa o proprietario: se esistono già, i dati si compilano da soli. Se non esistono, al salvataggio vengono creati automaticamente cliente e veicolo.
++        </div>
++        <div style={{ ...formGridStyle, marginTop: 12 }}>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Proprietario</label>
++            <input type="text" value={form.customer_name || ""} onChange={(e) => updateFormValue("appointments", "customer_name", e.target.value)} onBlur={() => resolveAppointmentAutofill(true)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Targa</label>
++            <input type="text" value={form.targa || ""} onChange={(e) => updateFormValue("appointments", "targa", e.target.value)} onBlur={() => resolveAppointmentAutofill(true)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Email</label>
++            <input type="text" value={form.customer_email || ""} onChange={(e) => updateFormValue("appointments", "customer_email", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Telefono</label>
++            <input type="text" value={form.customer_phone || ""} onChange={(e) => updateFormValue("appointments", "customer_phone", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Data e ora *</label>
++            <input type="datetime-local" value={formatDateForInput(form.scheduled_at)} onChange={(e) => updateFormValue("appointments", "scheduled_at", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Tipo veicolo</label>
++            <select value={form.vehicle_type || "Privato"} onChange={(e) => updateFormValue("appointments", "vehicle_type", normalizeTextValue("vehicle_type", e.target.value))} style={inputStyle}>
++              <option value="Privato">Privato</option>
++              <option value="Noleggio">Noleggio</option>
++            </select>
++          </div>
++          {appointmentCustomerVehicles.length > 0 ? (
++            <div style={fieldGroupStyle}>
++              <label style={fieldLabelStyle}>Veicolo cliente</label>
++              <select value={form.vehicle_id || ""} onChange={(e) => updateFormValue("appointments", "vehicle_id", e.target.value)} style={inputStyle}>
++                <option value="">Seleziona veicolo</option>
++                {appointmentCustomerVehicles.map((vehicle) => (
++                  <option key={vehicle.id} value={vehicle.id}>{upperCaseValue(vehicle.targa)}</option>
++                ))}
++              </select>
++            </div>
++          ) : null}
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Marca</label>
++            <input type="text" value={form.marca || ""} onChange={(e) => updateFormValue("appointments", "marca", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Modello</label>
++            <input type="text" value={form.modello || ""} onChange={(e) => updateFormValue("appointments", "modello", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Società di noleggio</label>
++            <input type="text" value={form.rental_company || ""} onChange={(e) => updateFormValue("appointments", "rental_company", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Misura pneumatici</label>
++            <input type="text" value={form.tire_size || ""} onChange={(e) => updateFormValue("appointments", "tire_size", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Stagionalità</label>
++            <input type="text" value={form.seasonality || ""} onChange={(e) => updateFormValue("appointments", "seasonality", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Battistrada anteriore (mm)</label>
++            <input type="number" value={form.tread_front_mm ?? ""} onChange={(e) => updateFormValue("appointments", "tread_front_mm", coerceInputValue({ type: "number" }, e.target.value))} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Battistrada posteriore (mm)</label>
++            <input type="number" value={form.tread_rear_mm ?? ""} onChange={(e) => updateFormValue("appointments", "tread_rear_mm", coerceInputValue({ type: "number" }, e.target.value))} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Scadenza revisione</label>
++            <input type="datetime-local" value={formatDateForInput(form.revision_due)} onChange={(e) => updateFormValue("appointments", "revision_due", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Scadenza tagliando</label>
++            <input type="datetime-local" value={formatDateForInput(form.service_due)} onChange={(e) => updateFormValue("appointments", "service_due", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Note veicolo</label>
++            <input type="text" value={form.vehicle_notes || ""} onChange={(e) => updateFormValue("appointments", "vehicle_notes", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Nota appuntamento</label>
++            <input type="text" value={form.note || ""} onChange={(e) => updateFormValue("appointments", "note", e.target.value)} style={inputStyle} />
++          </div>
++          <div style={fieldGroupStyle}>
++            <label style={fieldLabelStyle}>Servizi da fare</label>
++            <ServiceChecklist services={db.services || []} value={form.service_ids} onChange={(nextValue) => updateFormValue("appointments", "service_ids", nextValue)} />
++          </div>
++        </div>
++        {(matchedCustomer || selectedVehicle || appointmentLookupBusy) ? (
++          <div style={{ ...appointmentVehicleInfoStyle, marginBottom: 12 }}>
++            <div><strong>Ricerca automatica:</strong> {appointmentLookupBusy ? "ricerca in corso..." : "completata"}</div>
++            <div><strong>Cliente:</strong> {normalizeTextValue("name", matchedCustomer?.name || form.customer_name) || "-"}</div>
++            <div><strong>Veicolo:</strong> {upperCaseValue(selectedVehicle?.targa || form.targa) || "-"}</div>
++            <div><strong>Marca/Modello:</strong> {[normalizeTextValue("marca", selectedVehicle?.marca || form.marca), normalizeTextValue("modello", selectedVehicle?.modello || form.modello)].filter(Boolean).join(" ") || "-"}</div>
++          </div>
++        ) : null}
++        <VehicleTyrePreview front={form.tread_front_mm} rear={form.tread_rear_mm} />
++        <button style={primaryButtonStyle} onClick={createAppointmentSmart}>Salva</button>
++      </>
++    );
++  }
+@@ -1307,27 +1541,33 @@
+ 
+           {showForm[entityKey] && (
+             <>
+-              <div style={formGridStyle}>
+-                {config.fields.map((field) => (
+-                  <div key={field.key}>
+-                    {renderFieldInput(
+-                      entityKey,
+-                      field,
+-                      forms[entityKey],
+-                      (fieldKey, value) => updateFormValue(entityKey, fieldKey, value),
+-                      `add-${entityKey}`
+-                    )}
+-                  </div>
+-                ))}
+-              </div>
+-
+-              {entityKey === "vehicles" && (
+-                <VehicleTyrePreview
+-                  front={forms.vehicles.tread_front_mm}
+-                  rear={forms.vehicles.tread_rear_mm}
+-                />
++              {entityKey === "appointments" ? (
++                renderAppointmentSmartForm()
++              ) : (
++                <>
++                  <div style={formGridStyle}>
++                    {config.fields.map((field) => (
++                      <div key={field.key}>
++                        {renderFieldInput(
++                          entityKey,
++                          field,
++                          forms[entityKey],
++                          (fieldKey, value) => updateFormValue(entityKey, fieldKey, value),
++                          `add-${entityKey}`
++                        )}
++                      </div>
++                    ))}
++                  </div>
++
++                  {entityKey === "vehicles" && (
++                    <VehicleTyrePreview
++                      front={forms.vehicles.tread_front_mm}
++                      rear={forms.vehicles.tread_rear_mm}
++                    />
++                  )}
++
++                  <button
++                    style={primaryButtonStyle}
++                    onClick={() => createEntity(entityKey)}
++                  >
++                    Salva
++                  </button>
++                </>
+               )}
+-
+-              <button
+-                style={primaryButtonStyle}
+-                onClick={() => createEntity(entityKey)}
+-              >
+-                Salva
+-              </button>
+             </>
+           )}
